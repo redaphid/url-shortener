@@ -8,9 +8,11 @@
 const getLongUrl = async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
   const shortUrl = request.url.split("/").pop()
   if (!shortUrl) return new Response("Not found", { status: 404 })
-  const url = await env.short_urls.get(shortUrl)
-  if (url) return Response.redirect(url, 301)
-  return new Response("Not found", { status: 404 })
+  const record = await env.short_urls.get(shortUrl)
+  if (!record) return new Response("Not found", { status: 404 })
+  // if it doesn't have a protocol, add https://
+  const url = URL.canParse(record) ? record : `https://${record}`
+  return Response.redirect(url, 301)
 }
 
 const createShortUrl = async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {

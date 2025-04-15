@@ -18,8 +18,8 @@
 	],
 	"routes": [
 		{
-			"pattern": "2cb.pw/*",
-			"custom_domain": true
+			"pattern": "2cb.pw",
+			"custom_domain": true,
 		}
 	]
 	/**
