@@ -43,18 +43,17 @@ const listShortUrls = async (request: IRequest, env: Env, ctx: ExecutionContext)
 	for await (const record of records.keys) {
 		shortToLong.set(record.name, (await env.short_urls.get(record.name)) ?? "")
 	}
-	if (request.headers.get("accept") === "text/html") {
-		return new Response(
-			Array.from(shortToLong.entries())
-				.map(([shortUrl, longUrl]) => `<a href="${longUrl}">${shortUrl}</a>`)
-				.join("\n"),
-			{
-				status: 200
-			}
-		)
+	if (request.headers.get("accept") === "application/json") {
+		return new Response(JSON.stringify(shortToLong), { status: 200 })
 	}
-	// if they ask for json, return a json object keyed by short url
-	return new Response(JSON.stringify(shortToLong), { status: 200 })
+	return new Response(
+		Array.from(shortToLong.entries())
+			.map(([shortUrl, longUrl]) => `<a href="${longUrl}">${shortUrl}</a>`)
+			.join("\n"),
+		{
+			status: 200
+		}
+	)
 }
 
 const router = AutoRouter()
