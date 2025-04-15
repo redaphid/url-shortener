@@ -37,6 +37,7 @@ const deleteShortUrl = async (request: IRequest, env: Env, ctx: ExecutionContext
 }
 
 const listShortUrls = async (request: IRequest, env: Env, ctx: ExecutionContext): Promise<Response> => {
+	throw new Error("Waiting for idp")
 	// if they ask for html, return a list of short urls
 	const records = await env.short_urls.list()
 	const shortToLong = new Map<string, string>()
