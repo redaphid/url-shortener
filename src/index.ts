@@ -1,28 +1,45 @@
-/**
- * 2cb.pw - URL Shortener
- *  - if someone makes  GET request to /{short_url}
- *  - check if it exists in KV
- *  - if it does, redirect to the original URL permanently
- *  - if it doesn't, return a 404
- **/
-const getLongUrl = async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
-  const shortUrl = request.url.split("/").pop()
-  if (!shortUrl) return new Response("Not found", { status: 404 })
-  const record = await env.short_urls.get(shortUrl)
-  if (!record) return new Response("Not found", { status: 404 })
-  // if it doesn't have a protocol, add https://
-  const url = URL.canParse(record) ? record : `https://${record}`
-  return Response.redirect(url, 301)
+import { AutoRouter, IRequest } from "itty-router"
+
+const getLongUrl = async (request: IRequest, env: Env, ctx: ExecutionContext) => {
+	const { shortUrl } = request.params
+	const record = await env.short_urls.get(shortUrl)
+	if (!record) return new Response("Not found", { status: 404 })
+	// if it doesn't have a protocol, add https://
+	const url = URL.canParse(record) ? record : `https://${record}`
+	return Response.redirect(url, 301)
 }
 
-const createShortUrl = async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
-  return new Response("Not yet.", { status: 403 })
+const createShortUrlUnlessItExists = async (request: IRequest, env: Env, ctx: ExecutionContext): Promise<Response> => {
+	throw new Error("Waiting for idp")
+	const { shortUrl } = request.params
+	const record = await env.short_urls.get(shortUrl)
+	if (record) return new Response("Short URL already exists", { status: 400 })
+	const body = await request.json()
+	const { longUrl } = body as { longUrl: string }
+	await env.short_urls.put(shortUrl, longUrl)
+	return new Response("Created", { status: 201 })
 }
 
-export default {
-  async fetch(request, env, ctx): Promise<Response> {
-    if (request.method === "GET") return getLongUrl(request, env, ctx)
-    if (request.method === "POST") return createShortUrl(request, env, ctx)
-    return new Response("Not found", { status: 404 })
-  },
-} satisfies ExportedHandler<Env>
+const updateShortUrl = async (request: IRequest, env: Env, ctx: ExecutionContext): Promise<Response> => {
+	throw new Error("Waiting for idp")
+	const { shortUrl } = request.params
+	const body = await request.json()
+	const { longUrl } = body as { longUrl: string }
+	await env.short_urls.put(shortUrl, longUrl)
+	return new Response("Updated", { status: 200 })
+}
+
+const deleteShortUrl = async (request: IRequest, env: Env, ctx: ExecutionContext): Promise<Response> => {
+	throw new Error("Waiting for idp")
+	const { shortUrl } = request.params
+	await env.short_urls.delete(shortUrl)
+	return new Response("Deleted", { status: 200 })
+}
+
+const router = AutoRouter()
+	.get("/:shortUrl", getLongUrl)
+	.post("/:shortUrl", createShortUrlUnlessItExists)
+	.put("/:shortUrl", updateShortUrl)
+	.delete("/:shortUrl", deleteShortUrl)
+
+export default router
