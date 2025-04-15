@@ -15,6 +15,12 @@
 			"binding": "short_urls",
 			"id": "e239df04697f45d78631c29760c1a5b9"
 		}
+	],
+	"routes": [
+		{
+			"pattern": "2cb.pw/*",
+			"custom_domain": true
+		}
 	]
 	/**
 	 * Smart Placement
