@@ -1,11 +1,25 @@
 import { AutoRouter, IRequest } from "itty-router"
 
+const resolveUrl = async (path: string, env: Env): Promise<{ record: string, rest: string } | null> => {
+	// Try exact match first, then progressively shorter prefixes
+	const segments = path.split("/")
+	for (let i = segments.length; i > 0; i--) {
+		const prefix = segments.slice(0, i).join("/")
+		const record = await env.short_urls.get(prefix)
+		if (record) {
+			const rest = segments.slice(i).join("/")
+			return { record, rest }
+		}
+	}
+	return null
+}
+
 const getLongUrl = async (request: IRequest, env: Env, ctx: ExecutionContext) => {
-	const { shortUrl } = request.params
-	const record = await env.short_urls.get(shortUrl)
-	if (!record) return new Response("Not found", { status: 404 })
-	// if it doesn't have a protocol, add https://
-	const url = URL.canParse(record) ? record : `https://${record}`
+	const path = new URL(request.url).pathname.slice(1) // strip leading /
+	const match = await resolveUrl(path, env)
+	if (!match) return new Response("Not found", { status: 404 })
+	const base = URL.canParse(match.record) ? match.record : `https://${match.record}`
+	const url = match.rest ? `${base.replace(/\/$/, "")}/${match.rest}` : base
 	return Response.redirect(url, 301)
 }
 
@@ -58,10 +72,10 @@ const listShortUrls = async (request: IRequest, env: Env, ctx: ExecutionContext)
 }
 
 const router = AutoRouter()
-	.get("/:shortUrl", getLongUrl)
 	.post("/:shortUrl", createShortUrlUnlessItExists)
 	.put("/:shortUrl", updateShortUrl)
 	.delete("/:shortUrl", deleteShortUrl)
+	.get("/:shortUrl+", getLongUrl)
 	.get("*", listShortUrls)
 
 export default router
