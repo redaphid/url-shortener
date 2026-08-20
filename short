@@ -1,28 +1,135 @@
 #!/usr/bin/env fish
+# Shorten a URL on 2cb.pw. Works from any directory — it just talks to the worker.
+#
+#   short https://example.com/long/path      → https://2cb.pw/V1StGXR8
+#   short https://example.com/long/path blog → https://2cb.pw/blog
+#   short blog https://example.com           (order doesn't matter)
+#   short ls | short get <slug> | short rm <slug>
+#
+# Token: $SHORT_TOKEN, or ~/.config/2cb.pw/token
+# Point at a local `npm run dev` with: set -x SHORT_BASE http://localhost:8787
 
-set namespace "e239df04697f45d78631c29760c1a5b9"
-set script_dir (status dirname)
+set -q SHORT_BASE; or set SHORT_BASE "https://2cb.pw"
+set -l token_file "$HOME/.config/2cb.pw/token"
+
+function _usage
+    echo "Usage:"
+    echo "  short <url> [slug]   Create a short link (slug is optional)"
+    echo "  short get <slug>     Show where a slug points"
+    echo "  short ls             List every link"
+    echo "  short rm <slug>      Delete a link"
+end
 
 if test (count $argv) -lt 1
-    echo "Usage:"
-    echo "  short <path> <url>   Set 2cb.pw/<path> → <url>"
-    echo "  short get <path>     Get the URL for 2cb.pw/<path>"
+    _usage
     exit 1
 end
 
-cd $script_dir
+# `get` is a plain redirect lookup — no token needed, so resolve it before asking for one
+if test "$argv[1]" = get
+    test (count $argv) -eq 2; or begin
+        _usage
+        exit 1
+    end
+    set -l target (curl -sS -o /dev/null -w '%{redirect_url}' "$SHORT_BASE/$argv[2]")
+    if test -z "$target"
+        echo "$argv[2]: not found" >&2
+        exit 1
+    end
+    echo $target
+    exit 0
+end
 
-if test "$argv[1]" = "get"
-    if test (count $argv) -ne 2
-        echo "Usage: short get <path>"
-        exit 1
-    end
-    npx wrangler kv key get --namespace-id=$namespace --remote "$argv[2]"
+if set -q SHORT_TOKEN
+    set -g token $SHORT_TOKEN
+else if test -r $token_file
+    set -g token (string trim < $token_file)
 else
-    if test (count $argv) -ne 2
-        echo "Usage: short <path> <url>"
-        exit 1
+    echo "No token. Put one in $token_file or set \$SHORT_TOKEN." >&2
+    echo "Create one with: openssl rand -base64 32 | tee $token_file" >&2
+    echo "and register it with: npx wrangler secret put SHORTENER_TOKEN" >&2
+    exit 1
+end
+
+# Leaves the response in $body and the status in $code; returns false on any 4xx/5xx
+function _call --no-scope-shadowing
+    set -l method $argv[1]
+    set -l path $argv[2]
+    set -l lines (curl -sS --request $method \
+        --header "Authorization: Bearer $token" \
+        --header "Accept: application/json" \
+        --write-out '\n%{http_code}' \
+        $argv[3..-1] "$SHORT_BASE/$path")
+    set -g code $lines[-1]
+    set -g body (string join \n $lines[1..-2])
+    test "$code" -lt 400
+end
+
+function _die --no-scope-shadowing
+    if test -n "$body"
+        echo $body >&2
+    else
+        echo "$SHORT_BASE returned $code" >&2
     end
-    npx wrangler kv key put --namespace-id=$namespace --remote "$argv[1]" "$argv[2]"
-    and echo "✓ 2cb.pw/$argv[1] → $argv[2]"
+    exit 1
+end
+
+# Print the new link and put it on the clipboard if this machine has one
+function _report -a short long
+    if type -q wl-copy
+        echo -n $short | wl-copy
+        echo "✓ $short → $long (copied)"
+    else if type -q xclip
+        echo -n $short | xclip -selection clipboard
+        echo "✓ $short → $long (copied)"
+    else
+        echo "✓ $short → $long"
+    end
+end
+
+function _looks_like_url -a candidate
+    string match -qr '://|\.[a-z]{2,}' -- $candidate
+end
+
+function _field -a json name
+    echo $json | python3 -c "import json, sys; print(json.load(sys.stdin)[sys.argv[1]])" $name
+end
+
+switch $argv[1]
+    case ls list
+        _call GET ""; or _die
+        echo $body | python3 -c "
+import json, sys
+for link in json.load(sys.stdin)['links']:
+    print(f\"{link['slug']:<16} {link['url']}\")
+"
+    case rm delete
+        test (count $argv) -eq 2; or begin
+            _usage
+            exit 1
+        end
+        _call DELETE $argv[2]; or _die
+        echo "✗ $SHORT_BASE/$argv[2]"
+    case '*'
+        set -l url
+        set -l slug
+        for arg in $argv
+            if _looks_like_url $arg; and not set -q url[1]
+                set url $arg
+            else
+                set slug $arg
+            end
+        end
+        if not set -q url[1]
+            echo "That doesn't look like a URL: $argv" >&2
+            exit 1
+        end
+
+        # No slug → POST / and let the worker generate a nanoid. A slug → PUT, which upserts.
+        if set -q slug[1]
+            _call PUT $slug --data $url; or _die
+        else
+            _call POST "" --data $url; or _die
+        end
+        _report (_field $body shortUrl) $url
 end

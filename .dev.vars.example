@@ -1,0 +1,1 @@
+SHORTENER_TOKEN="a long random string; generate with: openssl rand -base64 32"
