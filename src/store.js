@@ -1,3 +1,5 @@
+import { deletePrefix } from './zip.js';
+
 /**
  * Records live in KV under their shortcode.
  *
@@ -61,20 +63,30 @@ export const randomCode = () => CODE_GROUPS.map(randomLetters).join('.');
 
 export const isValidCode = (code) => typeof code === 'string' && CODE_PATTERN.test(code) && !RESERVED.has(code.toLowerCase());
 
+/**
+ * Keys that may be looked up by a visitor. Links set by hand straight into KV can contain
+ * slashes (`app/list`), so each segment is checked on its own. The leading-alphanumeric rule
+ * still holds per segment, which keeps ROOT_CODE out of reach.
+ */
+export const isReadableKey = (key) => key.split('/').every((segment) => CODE_PATTERN.test(segment));
+
+/** Hand-set links are sometimes stored without a scheme, as `example.com/path`. */
+const withScheme = (target) => (/^[a-z][a-z0-9+.-]*:/i.test(target) ? target : `https://${target}`);
+
 export const readRecord = async (env, code) => {
 	const raw = await env.URL_MAP.get(code);
 	if (raw === null) return null;
-	if (!raw.startsWith('{')) return { type: 'url', url: raw };
+	if (!raw.startsWith('{')) return { type: 'url', url: withScheme(raw) };
 	try {
 		return JSON.parse(raw);
 	} catch {
-		return { type: 'url', url: raw };
+		return { type: 'url', url: withScheme(raw) };
 	}
 };
 
 export const writeRecord = (env, code, record) =>
 	env.URL_MAP.put(code, JSON.stringify(record), {
-		metadata: { type: record.type, name: record.name, size: record.size, createdAt: record.createdAt },
+		metadata: { type: record.type, name: record.name, size: record.size, files: record.files, createdAt: record.createdAt },
 	});
 
 /** Reserve a code so two concurrent uploads cannot claim the same one. */
@@ -96,6 +108,7 @@ export const deleteRecord = async (env, code) => {
 	const record = await readRecord(env, code);
 	if (!record) return false;
 	if (record.type === 'file' && record.key) await env.FILES.delete(record.key);
+	if (record.type === 'site' && record.prefix) await deletePrefix(env.FILES, record.prefix);
 	await env.URL_MAP.delete(code);
 	return true;
 };
@@ -104,8 +117,8 @@ export const deleteRecord = async (env, code) => {
  * Lists everything for the browse view, newest first.
  *
  * KV list only returns the metadata written alongside a record, which carries enough to
- * describe a file but never the target of a link. Legacy links have no metadata at all. So
- * only file records are served from metadata; anything else has its value read.
+ * describe a file or site but never the target of a link. Legacy links have no metadata at
+ * all. So only hosted content is served from metadata; anything else has its value read.
  */
 export const listRecords = async (env, max = 500) => {
 	const keys = [];
@@ -122,10 +135,10 @@ export const listRecords = async (env, max = 500) => {
 			.slice(0, max)
 			.filter(({ name }) => name !== ROOT_CODE)
 			.map(async ({ name, metadata }) => {
-				if (metadata && metadata.type === 'file') return { code: name, ...metadata };
+				if (metadata && (metadata.type === 'file' || metadata.type === 'site')) return { code: name, ...metadata };
 				const record = await readRecord(env, name);
 				if (!record) return { code: name };
-				const { key, ...rest } = record;
+				const { key, prefix, ...rest } = record;
 				return { code: name, ...rest };
 			})
 	);

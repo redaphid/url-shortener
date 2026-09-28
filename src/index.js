@@ -5,11 +5,13 @@ import {
 	cachePolicy,
 	claimCode,
 	deleteRecord,
+	isReadableKey,
 	isValidCode,
 	listRecords,
 	readRecord,
 	writeRecord,
 } from './store.js';
+import { ZipError, extractZip, looksLikeZip } from './zip.js';
 
 /** Chunk size the browser uploads with. Must stay under the Workers request-body limit. */
 const PART_SIZE = 64 * 1024 * 1024;
@@ -34,7 +36,7 @@ const contentDisposition = (name, attachment) => {
 	return `${attachment ? 'attachment' : 'inline'}; filename="${safe}"; filename*=UTF-8''${encoded}`;
 };
 
-const serveFile = async (request, env, record) => {
+const serveFile = async (request, env, record, { inline: alwaysInline = false } = {}) => {
 	// R2 reports a `range` on every read taken from headers, so the request is the only
 	// honest signal of whether the client actually asked for a partial response.
 	const rangeRequested = request.headers.has('range');
@@ -49,7 +51,7 @@ const serveFile = async (request, env, record) => {
 	if (record.contentType) headers.set('Content-Type', record.contentType);
 
 	const wantsDownload = new URL(request.url).searchParams.has('dl');
-	const inline = !wantsDownload && INLINE_TYPES.test(record.contentType || '');
+	const inline = !wantsDownload && (alwaysInline || INLINE_TYPES.test(record.contentType || ''));
 	headers.set('Content-Disposition', contentDisposition(record.name, !inline));
 
 	// `body` is absent when onlyIf turns the read into a 304.
@@ -67,30 +69,103 @@ const serveFile = async (request, env, record) => {
 	return new Response(body, { headers });
 };
 
+// A 301 is cached indefinitely by browsers whatever we say, so anything short of a
+// permanent policy has to go out as a 302 for the policy to mean anything.
+const redirect = (location, record) => {
+	const policy = record.cacheControl || PERMANENT_CACHE;
+	return new Response(null, {
+		status: policy === PERMANENT_CACHE ? 301 : 302,
+		headers: { Location: location, 'Cache-Control': policy },
+	});
+};
+
+/**
+ * Finds the record a path belongs to, trying the longest key first so a hand-set `app/list`
+ * wins over `app`. Whatever follows the matched key comes back as `rest`, still URL-encoded
+ * (for appending to a link) and decoded (for naming a file inside a site).
+ */
+const resolvePath = async (env, pathname) => {
+	const segments = pathname.slice(1).split('/');
+	for (let length = segments.length; length > 0; length -= 1) {
+		const code = segments.slice(0, length).map(decodeURIComponent).join('/');
+		if (!isReadableKey(code)) continue;
+		const record = await readRecord(env, code);
+		if (!record) continue;
+		const rawRest = segments.slice(length).join('/');
+		return { code, record, rawRest, rest: decodeURIComponent(rawRest) };
+	}
+	return null;
+};
+
+const serveSite = async (request, env, record, rest) => {
+	const url = new URL(request.url);
+
+	// Without the trailing slash, every relative link in the page would resolve one level up.
+	if (rest === '' && !url.pathname.endsWith('/')) return redirect(`${url.pathname}/${url.search}`, record);
+
+	const path = rest === '' || rest.endsWith('/') ? `${rest}index.html` : rest;
+	const serve = (key) =>
+		serveFile(request, env, { key, name: key.slice(key.lastIndexOf('/') + 1), cacheControl: record.cacheControl }, { inline: true });
+
+	const response = await serve(record.prefix + path);
+	if (response.status !== 404) return response;
+
+	// A directory asked for without its slash: send it where its index can be found.
+	if (!rest.endsWith('/') && (await env.FILES.head(`${record.prefix}${rest}/index.html`))) {
+		return redirect(`${url.pathname}/${url.search}`, record);
+	}
+
+	const notFound = await serve(`${record.prefix}404.html`);
+	if (notFound.status === 404) return fail(404, 'Not found');
+	return new Response(notFound.body, { status: 404, headers: notFound.headers });
+};
+
 const handleRead = async (request, env) => {
 	const url = new URL(request.url);
-	const code = decodeURIComponent(url.pathname.slice(1));
 
 	// /up is a door for Cloudflare Access, which matches by path prefix: gating /up* prompts
 	// a login and then lands here, while gating / would wall off every public short link.
-	if (code === 'up') return Response.redirect(new URL('/', url).toString(), 302);
+	if (url.pathname === '/up') return Response.redirect(new URL('/', url).toString(), 302);
 
 	// The root is the UI, stored as an ordinary record, so it takes the same path as any file.
-	if (code !== '' && !isValidCode(code)) return fail(404, 'Not found');
+	let match;
+	try {
+		match = url.pathname === '/' ? { record: await readRecord(env, ROOT_CODE), rest: '', rawRest: '' } : await resolvePath(env, url.pathname);
+	} catch {
+		return fail(400, 'Malformed path');
+	}
+	if (!match || !match.record) return fail(404, 'Not found');
 
-	const record = await readRecord(env, code === '' ? ROOT_CODE : code);
-	if (!record) return fail(404, 'Not found');
+	const { record, rest, rawRest } = match;
 	if (record.type === 'pending') return fail(409, 'Still uploading');
-	if (record.type === 'file') return serveFile(request, env, record);
+	if (record.type === 'site') return serveSite(request, env, record, rest);
+	if (record.type === 'file') return rest ? fail(404, 'Not found') : serveFile(request, env, record);
 
-	// A 301 is cached indefinitely by browsers whatever we say, so anything short of a
-	// permanent policy has to go out as a 302 for the policy to mean anything.
-	const policy = record.cacheControl || PERMANENT_CACHE;
-	const permanent = policy === PERMANENT_CACHE;
-	return new Response(null, {
-		status: permanent ? 301 : 302,
-		headers: { Location: record.url, 'Cache-Control': policy },
-	});
+	// Anything after a link's code is carried over onto its target: /docs/api -> <docs>/api.
+	const target = rawRest ? `${record.url.replace(/\/$/, '')}/${rawRest}` : record.url;
+	return redirect(target, record);
+};
+
+const wantsExtraction = (choice) => !['0', 'false', 'no'].includes(String(choice ?? '').toLowerCase());
+
+/**
+ * Turns an uploaded zip into a site served under its code. The archive itself is only a
+ * delivery vehicle, so it is removed whether or not unpacking worked.
+ */
+const publishSite = async (request, env, { code, archiveKey, name, cacheControl }) => {
+	const prefix = `${code}/site/`;
+	try {
+		const { files, size } = await extractZip(env.FILES, archiveKey, prefix);
+		await writeRecord(env, code, { type: 'site', prefix, name, files, size, cacheControl, createdAt: new Date().toISOString() });
+		return json({ code, url: `${shortUrl(request, code)}/`, files }, 201);
+	} catch (error) {
+		if (!(error instanceof ZipError)) throw error;
+		const held = await readRecord(env, code);
+		if (held && held.type === 'pending') await env.URL_MAP.delete(code);
+		return fail(422, error.message);
+	} finally {
+		await env.FILES.delete(archiveKey);
+	}
 };
 
 const routes = {
@@ -125,6 +200,10 @@ const routes = {
 		const key = publishingUi ? `${ROOT_CODE}/${name}` : `${code}/${name}`;
 		const object = await env.FILES.put(key, request.body, { httpMetadata: { contentType } });
 
+		if (!publishingUi && wantsExtraction(params.get('extract')) && looksLikeZip(name, contentType)) {
+			return publishSite(request, env, { code, archiveKey: key, name, cacheControl });
+		}
+
 		await writeRecord(env, code, {
 			type: 'file',
 			key,
@@ -138,7 +217,7 @@ const routes = {
 	},
 
 	'POST /api/multipart/create': async (request, env) => {
-		const { name = 'file', type = 'application/octet-stream', code: requested, cache } = await request.json();
+		const { name = 'file', type = 'application/octet-stream', code: requested, cache, extract } = await request.json();
 		const { code, error } = await claimCode(env, requested);
 		if (error) return fail(409, error);
 
@@ -149,6 +228,7 @@ const routes = {
 			type: 'pending',
 			key,
 			name,
+			extract: wantsExtraction(extract) && looksLikeZip(name, type),
 			cacheControl: cachePolicy(cache),
 			createdAt: new Date().toISOString(),
 		});
@@ -173,6 +253,11 @@ const routes = {
 
 		const upload = env.FILES.resumeMultipartUpload(key, uploadId);
 		const object = await upload.complete(parts);
+
+		const pending = await readRecord(env, code);
+		if (pending && pending.type === 'pending' && pending.extract && pending.key === key) {
+			return publishSite(request, env, { code, archiveKey: key, name: pending.name, cacheControl: pending.cacheControl });
+		}
 
 		await writeRecord(env, code, {
 			type: 'file',

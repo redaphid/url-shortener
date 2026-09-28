@@ -341,3 +341,257 @@ describe('browsing', () => {
 		expect(response.status).toBe(403);
 	});
 });
+
+/**
+ * Builds a real zip in memory. Entries are deflated unless `store` is set, so both of the
+ * methods zip tools write get exercised. CRCs are computed properly so the fixtures would
+ * open in any unzip tool, even though the Worker does not check them.
+ */
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+	let c = n;
+	for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+	return c >>> 0;
+});
+const crc32 = (bytes) => {
+	let crc = 0xffffffff;
+	for (const byte of bytes) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+	return (crc ^ 0xffffffff) >>> 0;
+};
+const deflateRaw = async (bytes) =>
+	new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer());
+
+const makeZip = async (files, { store = false } = {}) => {
+	const encoder = new TextEncoder();
+	const locals = [];
+	const centrals = [];
+	let offset = 0;
+
+	for (const [name, content] of Object.entries(files)) {
+		const nameBytes = encoder.encode(name);
+		const data = typeof content === 'string' ? encoder.encode(content) : content;
+		const isDirectory = name.endsWith('/');
+		const method = store || isDirectory ? 0 : 8;
+		const packed = method === 8 ? await deflateRaw(data) : data;
+
+		const local = new DataView(new ArrayBuffer(30));
+		local.setUint32(0, 0x04034b50, true);
+		local.setUint16(4, 20, true);
+		local.setUint16(6, 0x800, true);
+		local.setUint16(8, method, true);
+		local.setUint32(14, crc32(data), true);
+		local.setUint32(18, packed.byteLength, true);
+		local.setUint32(22, data.byteLength, true);
+		local.setUint16(26, nameBytes.byteLength, true);
+		locals.push(new Uint8Array(local.buffer), nameBytes, packed);
+
+		const central = new DataView(new ArrayBuffer(46));
+		central.setUint32(0, 0x02014b50, true);
+		central.setUint16(4, 20, true);
+		central.setUint16(6, 20, true);
+		central.setUint16(8, 0x800, true);
+		central.setUint16(10, method, true);
+		central.setUint32(16, crc32(data), true);
+		central.setUint32(20, packed.byteLength, true);
+		central.setUint32(24, data.byteLength, true);
+		central.setUint16(28, nameBytes.byteLength, true);
+		central.setUint32(42, offset, true);
+		centrals.push(new Uint8Array(central.buffer), nameBytes);
+
+		offset += 30 + nameBytes.byteLength + packed.byteLength;
+	}
+
+	const directorySize = centrals.reduce((total, part) => total + part.byteLength, 0);
+	const end = new DataView(new ArrayBuffer(22));
+	end.setUint32(0, 0x06054b50, true);
+	end.setUint16(8, Object.keys(files).length, true);
+	end.setUint16(10, Object.keys(files).length, true);
+	end.setUint32(12, directorySize, true);
+	end.setUint32(16, offset, true);
+
+	return new Blob([...locals, ...centrals, new Uint8Array(end.buffer)]);
+};
+
+const uploadZip = (zip, query) =>
+	SELF.fetch(`https://2cb.pw/api/upload?${new URLSearchParams({ type: 'application/zip', ...query })}`, {
+		method: 'POST',
+		headers: AUTH,
+		body: zip,
+	});
+
+// The keeper's log: a small site that should come out of its archive exactly as it went in.
+const LOGBOOK = {
+	'logbook/index.html': '<h1>Keeper\'s log</h1><link rel="stylesheet" href="lamp.css">',
+	'logbook/lamp.css': 'h1 { color: #ffb000; }',
+	'logbook/nights/index.html': '<p>The lamp was lit at dusk.</p>',
+	'logbook/nights/0412.txt': 'Fog. Horn every thirty seconds. No ships.',
+	'logbook/404.html': '<p>That page was lost at sea.</p>',
+	'__MACOSX/logbook/._index.html': 'resource fork',
+	'logbook/.DS_Store': 'finder litter',
+	'logbook/nights/': '',
+};
+
+describe('zip sites', () => {
+	it('unpacks an uploaded zip and serves it under the chosen code', async () => {
+		const response = await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'keeper' });
+		expect(response.status).toBe(201);
+		expect(await response.json()).toMatchObject({ code: 'keeper', url: 'https://2cb.pw/keeper/', files: 5 });
+
+		const index = await SELF.fetch('https://2cb.pw/keeper/');
+		expect(index.status).toBe(200);
+		expect(index.headers.get('content-type')).toContain('text/html');
+		expect(await index.text()).toContain("Keeper's log");
+
+		const css = await SELF.fetch('https://2cb.pw/keeper/lamp.css');
+		expect(css.headers.get('content-type')).toContain('text/css');
+		expect(css.headers.get('content-disposition')).toMatch(/^inline/);
+		expect(await css.text()).toContain('#ffb000');
+
+		expect(await (await SELF.fetch('https://2cb.pw/keeper/nights/0412.txt')).text()).toContain('No ships');
+	});
+
+	it('peels off the single folder a zip tool wraps everything in, and drops Mac litter', async () => {
+		await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'peeled' });
+		const { objects } = await env.FILES.list({ prefix: 'peeled/' });
+		expect(objects.map(({ key }) => key).sort()).toEqual([
+			'peeled/site/404.html',
+			'peeled/site/index.html',
+			'peeled/site/lamp.css',
+			'peeled/site/nights/0412.txt',
+			'peeled/site/nights/index.html',
+		]);
+	});
+
+	it('keeps top-level paths when there is no single wrapper folder', async () => {
+		await uploadZip(await makeZip({ 'index.html': 'root', 'js/app.js': 'go()' }, { store: true }), { name: 'flat.zip', code: 'flat' });
+		expect(await (await SELF.fetch('https://2cb.pw/flat/')).text()).toBe('root');
+		const script = await SELF.fetch('https://2cb.pw/flat/js/app.js');
+		expect(script.headers.get('content-type')).toContain('text/javascript');
+		expect(await script.text()).toBe('go()');
+	});
+
+	it('adds the trailing slash so relative links resolve inside the site', async () => {
+		await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'slash' });
+		const bare = await SELF.fetch('https://2cb.pw/slash?from=sea', { redirect: 'manual' });
+		expect(bare.status).toBe(301);
+		expect(bare.headers.get('location')).toBe('/slash/?from=sea');
+
+		const directory = await SELF.fetch('https://2cb.pw/slash/nights', { redirect: 'manual' });
+		expect(directory.status).toBe(301);
+		expect(directory.headers.get('location')).toBe('/slash/nights/');
+		expect(await (await SELF.fetch('https://2cb.pw/slash/nights/')).text()).toContain('lit at dusk');
+	});
+
+	it("serves the site's own 404 page for a missing path", async () => {
+		await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'lost' });
+		const response = await SELF.fetch('https://2cb.pw/lost/nights/0413.txt');
+		expect(response.status).toBe(404);
+		expect(await response.text()).toContain('lost at sea');
+	});
+
+	it('404s plainly when the site has no 404 page', async () => {
+		await uploadZip(await makeZip({ 'index.html': 'hi' }), { name: 'tiny.zip', code: 'tiny' });
+		expect(await SELF.fetch('https://2cb.pw/tiny/nope.png')).toMatchObject({ status: 404 });
+	});
+
+	it('does not keep the archive around after unpacking it', async () => {
+		await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'noarchive' });
+		expect(await env.FILES.head('noarchive/logbook.zip')).toBeNull();
+	});
+
+	it('stores the zip as an ordinary file when asked not to extract', async () => {
+		const zip = await makeZip(LOGBOOK);
+		await uploadZip(zip, { name: 'logbook.zip', code: 'packed', extract: '0' });
+		const response = await SELF.fetch('https://2cb.pw/packed');
+		expect(response.status).toBe(200);
+		expect((await response.arrayBuffer()).byteLength).toBe(zip.size);
+	});
+
+	it('refuses a broken archive and leaves the code free', async () => {
+		const response = await uploadZip('this is not a zip at all, just a message in a bottle', { name: 'bottle.zip', code: 'bottle' });
+		expect(response.status).toBe(422);
+		expect((await response.json()).error).toMatch(/zip/i);
+		expect(await env.URL_MAP.get('bottle')).toBeNull();
+		expect((await env.FILES.list({ prefix: 'bottle/' })).objects).toHaveLength(0);
+	});
+
+	it('deletes every file of a site along with its code', async () => {
+		await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'razed' });
+		await SELF.fetch('https://2cb.pw/api/delete', {
+			method: 'POST',
+			headers: { ...AUTH, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ code: 'razed' }),
+		});
+		expect((await env.FILES.list({ prefix: 'razed/' })).objects).toHaveLength(0);
+		expect(await SELF.fetch('https://2cb.pw/razed/')).toMatchObject({ status: 404 });
+	});
+
+	it('lists a site in the browse view', async () => {
+		await uploadZip(await makeZip(LOGBOOK), { name: 'logbook.zip', code: 'listed' });
+		const { items } = await (await SELF.fetch('https://2cb.pw/api/list', { headers: AUTH })).json();
+		expect(items).toEqual([expect.objectContaining({ code: 'listed', type: 'site', name: 'logbook.zip', files: 5 })]);
+		expect(items[0]).not.toHaveProperty('prefix');
+	});
+
+	it('unpacks a zip that arrived in parts', async () => {
+		// R2 needs every part but the last to be at least 5 MiB, so the archive carries ballast.
+		const ballast = new Uint8Array(6 * 1024 * 1024).fill(7);
+		const zip = new Uint8Array(await (await makeZip({ 'index.html': 'heavy seas', 'ballast.bin': ballast }, { store: true })).arrayBuffer());
+
+		const created = await SELF.fetch('https://2cb.pw/api/multipart/create', {
+			method: 'POST',
+			headers: { ...AUTH, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'heavy.zip', type: 'application/zip', code: 'heavy' }),
+		});
+		const { code, key, uploadId } = await created.json();
+
+		const cut = 5 * 1024 * 1024;
+		const parts = [];
+		for (const [index, chunk] of [zip.subarray(0, cut), zip.subarray(cut)].entries()) {
+			const query = new URLSearchParams({ key, uploadId, part: String(index + 1) });
+			const response = await SELF.fetch(`https://2cb.pw/api/multipart/part?${query}`, { method: 'PUT', headers: AUTH, body: chunk });
+			parts.push(await response.json());
+		}
+
+		const completed = await SELF.fetch('https://2cb.pw/api/multipart/complete', {
+			method: 'POST',
+			headers: { ...AUTH, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ code, key, uploadId, name: 'heavy.zip', type: 'application/zip', parts }),
+		});
+		expect(completed.status).toBe(201);
+		expect(await (await SELF.fetch('https://2cb.pw/heavy/')).text()).toBe('heavy seas');
+		expect((await (await SELF.fetch('https://2cb.pw/heavy/ballast.bin')).arrayBuffer()).byteLength).toBe(ballast.byteLength);
+	});
+});
+
+describe('subpaths', () => {
+	it('carries the rest of the path over onto a link target', async () => {
+		await env.URL_MAP.put('docs', JSON.stringify({ type: 'url', url: 'https://example.com/manual/' }));
+		const response = await SELF.fetch('https://2cb.pw/docs/chapter%202/tides', { redirect: 'manual' });
+		expect(response.headers.get('location')).toBe('https://example.com/manual/chapter%202/tides');
+	});
+
+	it('prefers the longest matching key', async () => {
+		await env.URL_MAP.put('app', 'https://example.com/app');
+		await env.URL_MAP.put('app/list', 'https://example.com/special-list');
+		const exact = await SELF.fetch('https://2cb.pw/app/list', { redirect: 'manual' });
+		expect(exact.headers.get('location')).toBe('https://example.com/special-list');
+		const deeper = await SELF.fetch('https://2cb.pw/app/list/7', { redirect: 'manual' });
+		expect(deeper.headers.get('location')).toBe('https://example.com/special-list/7');
+	});
+
+	it('gives a scheme to hand-set links stored without one', async () => {
+		await env.URL_MAP.put('bare', 'example.com/harbour');
+		const response = await SELF.fetch('https://2cb.pw/bare/master', { redirect: 'manual' });
+		expect(response.headers.get('location')).toBe('https://example.com/harbour/master');
+	});
+
+	it('does not invent paths inside a single hosted file', async () => {
+		await SELF.fetch('https://2cb.pw/api/upload?name=a.txt&type=text/plain&code=single', { method: 'POST', headers: AUTH, body: 'x' });
+		expect(await SELF.fetch('https://2cb.pw/single/more')).toMatchObject({ status: 404 });
+	});
+
+	it('never reaches the UI record through a path', async () => {
+		await SELF.fetch('https://2cb.pw/api/upload?root=1&name=index.html&type=text/html', { method: 'POST', headers: AUTH, body: 'ui' });
+		expect(await SELF.fetch('https://2cb.pw/_root/index.html')).toMatchObject({ status: 404 });
+	});
+});

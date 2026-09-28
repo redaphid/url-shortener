@@ -96,6 +96,7 @@
 		#drop.hot { border-color: var(--accent); background: var(--panel-2); }
 		#drop strong { display: block; font-size: 18px; margin-bottom: 6px; }
 		#drop span { color: var(--muted); font-size: 14px; }
+		#file-code { margin-top: 12px; }
 
 		input[type="text"], input[type="url"], textarea {
 			width: 100%;
@@ -242,6 +243,7 @@
 				<span>or click to pick &middot; or press <span id="paste-key">Ctrl-V</span> to paste</span>
 			</div>
 			<input type="file" id="picker" multiple hidden />
+			<input type="text" id="file-code" placeholder="custom code (optional) &middot; a .zip is published as a site there" autocapitalize="off" spellcheck="false" />
 		</section>
 
 		<section class="panel" id="panel-link">
@@ -376,20 +378,30 @@
 			return payload;
 		};
 
-		const uploadSmall = (file, row) => {
+		// A custom code is used once: the first file dropped claims it, and the field clears.
+		const takeFileCode = () => {
+			const field = document.getElementById('file-code');
+			const code = field.value.trim();
+			field.value = '';
+			return code ? { code } : {};
+		};
+
+		const uploadSmall = (file, row, code) => {
 			const query = new URLSearchParams({
 				name: file.name,
 				type: file.type || 'application/octet-stream',
 				cache: cacheChoice(),
+				...code,
 			});
 			return send('POST', `/api/upload?${query}`, file, (fraction) => row.progress(fraction));
 		};
 
-		const uploadLarge = async (file, row) => {
+		const uploadLarge = async (file, row, code) => {
 			const created = await postJson('/api/multipart/create', {
 				name: file.name,
 				type: file.type || 'application/octet-stream',
 				cache: cacheChoice(),
+				...code,
 			});
 			const size = created.partSize || partSize;
 			const total = Math.ceil(file.size / size);
@@ -423,8 +435,9 @@
 
 		const upload = async (file) => {
 			const row = addRow(file.name, humanSize(file.size));
+			const code = takeFileCode();
 			try {
-				const result = file.size > partSize ? await uploadLarge(file, row) : await uploadSmall(file, row);
+				const result = file.size > partSize ? await uploadLarge(file, row, code) : await uploadSmall(file, row, code);
 				row.done(result.url);
 			} catch (error) {
 				row.fail(error.message);
@@ -527,6 +540,7 @@
 
 		const describe = (entry) => {
 			if (entry.type === 'file') return entry.name || 'file';
+			if (entry.type === 'site') return `${entry.name || 'site'} (unpacked)`;
 			if (entry.type === 'pending') return 'upload in progress';
 			return entry.url || '';
 		};
@@ -542,7 +556,9 @@
 				const row = document.createElement('div');
 				row.className = 'entry';
 
-				const kind = entry.type === 'file' ? `file${entry.size ? ` &middot; ${humanSize(entry.size)}` : ''}` : 'link';
+				const size = entry.size ? ` &middot; ${humanSize(entry.size)}` : '';
+				const kind =
+					entry.type === 'file' ? `file${size}` : entry.type === 'site' ? `site &middot; ${entry.files} files${size}` : 'link';
 				row.innerHTML = `<div class="body">
 						<a class="code" target="_blank" rel="noopener"></a>
 						<div class="target"></div>
@@ -551,14 +567,14 @@
 					<button class="copy danger">Delete</button>`;
 
 				const link = row.querySelector('.code');
-				link.href = `/${entry.code}`;
+				link.href = entry.type === 'site' ? `/${entry.code}/` : `/${entry.code}`;
 				link.textContent = entry.code;
 				link.insertAdjacentHTML('beforeend', `<span class="kind">${kind}</span>`);
 				row.querySelector('.target').textContent = describe(entry);
 
 				const [copy, remove] = row.querySelectorAll('button');
 				copy.addEventListener('click', async () => {
-					await navigator.clipboard.writeText(`${origin}/${entry.code}`);
+					await navigator.clipboard.writeText(`${origin}${link.getAttribute('href')}`);
 					copy.textContent = 'Copied';
 					copy.classList.add('done');
 				});
